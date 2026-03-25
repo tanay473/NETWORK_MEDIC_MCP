@@ -6,9 +6,10 @@ Claude Desktop is the LLM brain — it receives network state, decides the plan,
 and calls tools per action. No separate Anthropic API key needed.
 
 Tools exposed:
-  - observe_network    : runs probes, returns state + diagnostic context for Claude to reason over
-  - execute_action     : executes a single action Claude has decided on (after user approves in chat)
-  - verify_action      : post-action probe diff — Claude calls this after each execute_action
+  - observe_network    : full probe run — connectivity, DNS, latency + device state
+  - check_device_state : targeted device state probes — gateway, interfaces, ports, wifi
+  - execute_action     : executes a single approved action
+  - verify_action      : post-action probe diff
   - finalise_session   : saves post-state, returns session summary
   - get_action_history : returns recent action log
   - submit_feedback    : lets user rate the session
@@ -20,9 +21,6 @@ import asyncio
 from pathlib import Path
 
 # ── Ensure project root is on sys.path ────────────────────────────────────────
-# mcp_server.py is run directly by Claude Desktop as a script.
-# Without this, imports like 'from server.orchestrator import ...' fail
-# because Python doesn't know where the project root is.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -33,6 +31,7 @@ from mcp.server.stdio import stdio_server
 from mcp import types
 
 from server.orchestrator import observe, execute_action, verify_action, finalise
+from modules.monitor.probes import check_gateway, check_interfaces, check_ports, check_wifi
 from memory.store import save_feedback, get_recent_actions
 from utils.logger import get_logger
 
@@ -47,13 +46,32 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="observe_network",
             description=(
-                "Run network probes (connectivity, DNS, latency) and return the current system state "
-                "along with a diagnostic context. Use this first to understand what is wrong before "
-                "deciding which actions to take. Returns state, anomalies, and action history."
+                "Run all network probes — connectivity, DNS, latency, gateway, interfaces, "
+                "ports, and WiFi state. Returns the complete system state with anomalies and "
+                "action history. Use this first to understand what is wrong before deciding actions."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="check_device_state",
+            description=(
+                "Run targeted device-level probes to inspect the local machine's network state. "
+                "Checks: default gateway reachability, network interface up/down status, "
+                "critical port availability (53/80/443), and WiFi/Ethernet connection info. "
+                "Use this when you need device-level detail without running the full observe cycle."
             ),
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "probes": {
+                        "type": "array",
+                        "description": "Which probes to run. Omit to run all four.",
+                        "items": {
+                            "type": "string",
+                            "enum": ["gateway", "interfaces", "ports", "wifi"],
+                        },
+                    }
+                },
                 "required": [],
             },
         ),
@@ -61,8 +79,7 @@ async def list_tools() -> list[types.Tool]:
             name="execute_action",
             description=(
                 "Execute a single remediation action. Only call this after presenting the action "
-                "to the user and receiving their explicit approval in the conversation. "
-                "The action must conform to the plan schema structure."
+                "to the user and receiving their explicit approval in the conversation."
             ),
             inputSchema={
                 "type": "object",
@@ -88,20 +105,14 @@ async def list_tools() -> list[types.Tool]:
             name="verify_action",
             description=(
                 "Run post-action verification after an execute_action call. "
-                "Re-runs the relevant network probes and returns a verdict: "
+                "Re-runs the relevant probes and returns a verdict: "
                 "resolved (fixed), unchanged (no effect), or degraded (got worse — triggers rollback)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "action_type": {
-                        "type": "string",
-                        "description": "The action_type that was just executed",
-                    },
-                    "action_id": {
-                        "type": "string",
-                        "description": "The action_id that was just executed",
-                    },
+                    "action_type": {"type": "string", "description": "The action_type just executed"},
+                    "action_id":   {"type": "string", "description": "The action_id just executed"},
                 },
                 "required": ["action_type", "action_id"],
             },
@@ -111,13 +122,9 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Call this after all actions are complete. "
                 "Saves the final network state, computes the overall session verdict, "
-                "and returns a summary for you to present to the user."
+                "and returns a summary to present to the user."
             ),
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
+            inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
             name="get_action_history",
@@ -125,11 +132,7 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "n": {
-                        "type": "integer",
-                        "description": "Number of recent actions to return (default: 10)",
-                        "default": 10,
-                    }
+                    "n": {"type": "integer", "description": "Number of recent actions to return (default: 10)", "default": 10}
                 },
                 "required": [],
             },
@@ -140,18 +143,9 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "plan_id": {
-                        "type": "string",
-                        "description": "The plan_id from the session being rated",
-                    },
-                    "feedback": {
-                        "type": "string",
-                        "enum": ["helpful", "not_helpful", "neutral"],
-                    },
-                    "notes": {
-                        "type": "string",
-                        "description": "Optional comments",
-                    },
+                    "plan_id":  {"type": "string", "description": "The plan_id from the session being rated"},
+                    "feedback": {"type": "string", "enum": ["helpful", "not_helpful", "neutral"]},
+                    "notes":    {"type": "string", "description": "Optional comments"},
                 },
                 "required": ["plan_id", "feedback"],
             },
@@ -170,6 +164,31 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
         except Exception as exc:
             log.error(f"observe_network failed: {exc}")
+            return [types.TextContent(type="text", text=f"Error: {exc}")]
+
+    # ── check_device_state ────────────────────────────────────────────────────
+    elif name == "check_device_state":
+        log.info("MCP tool called: check_device_state")
+        try:
+            probe_map = {
+                "gateway":    check_gateway,
+                "interfaces": check_interfaces,
+                "ports":      check_ports,
+                "wifi":       check_wifi,
+            }
+            requested = arguments.get("probes") or list(probe_map.keys())
+            results = {}
+
+            def run_probes():
+                for probe_name in requested:
+                    if probe_name in probe_map:
+                        results[probe_name] = probe_map[probe_name]()
+                return results
+
+            data = await asyncio.get_event_loop().run_in_executor(None, run_probes)
+            return [types.TextContent(type="text", text=json.dumps(data, indent=2, default=str))]
+        except Exception as exc:
+            log.error(f"check_device_state failed: {exc}")
             return [types.TextContent(type="text", text=f"Error: {exc}")]
 
     # ── execute_action ────────────────────────────────────────────────────────
