@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment variables — never commit your keys
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+
+# Memory data — runtime state, not source code
+memory/data/action_log.json
+memory/data/state_history.json
+memory/data/rollback_log.json
+memory/data/user_feedback.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user

@@ -1,0 +1,80 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ActionLogEntry",
+  "description": "Schema for a single entry in memory/data/action_log.json. Written by memory/store.py after every action execution.",
+  "type": "object",
+  "required": ["entry_id", "timestamp", "action_type", "status", "plan_id"],
+  "additionalProperties": false,
+  "properties": {
+    "entry_id": {
+      "type": "string",
+      "description": "UUID for this log entry"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of when the action was executed"
+    },
+    "plan_id": {
+      "type": "string",
+      "description": "ID of the plan this action belonged to"
+    },
+    "action_id": {
+      "type": "string",
+      "description": "ID of the specific action within the plan"
+    },
+    "action_type": {
+      "type": "string",
+      "description": "Logical action type that was executed"
+    },
+    "os": {
+      "type": "string",
+      "enum": ["linux", "windows", "mac", "unknown"],
+      "description": "OS on which the action was executed"
+    },
+    "command_executed": {
+      "type": "string",
+      "description": "Actual system command that was run"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["approved", "rejected", "executed", "failed", "rolled_back", "skipped"],
+      "description": "Final status of this action"
+    },
+    "approved_by": {
+      "type": "string",
+      "enum": ["user", "auto"],
+      "description": "Whether approval came from user (HIL) or was auto-approved"
+    },
+    "stdout": {
+      "type": "string",
+      "description": "Standard output from the command"
+    },
+    "stderr": {
+      "type": "string",
+      "description": "Standard error from the command"
+    },
+    "returncode": {
+      "type": "integer",
+      "description": "Process return code"
+    },
+    "risk_level": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "verify_result": {
+      "type": "string",
+      "enum": ["resolved", "unchanged", "degraded", "skipped"],
+      "description": "Outcome from verifier after this action"
+    },
+    "user_feedback": {
+      "type": "string",
+      "enum": ["helpful", "not_helpful", "neutral", null],
+      "description": "Optional post-session feedback from user"
+    },
+    "notes": {
+      "type": "string",
+      "description": "Any additional context or error message"
+    }
+  }
+}

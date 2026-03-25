@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RemediationPlan",
+  "description": "Schema for the LLM-generated remediation plan. Validated by plan_parser.py before any action is taken.",
+  "type": "object",
+  "required": ["plan_id", "generated_at", "diagnosis", "actions"],
+  "additionalProperties": false,
+  "properties": {
+    "plan_id": {
+      "type": "string",
+      "description": "UUID for this plan instance"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the plan was generated"
+    },
+    "diagnosis": {
+      "type": "string",
+      "description": "LLM's natural language summary of the detected issue"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "LLM confidence score for the diagnosis (0.0 - 1.0)"
+    },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": ["action_id", "action_type", "description", "risk_level"],
+        "additionalProperties": false,
+        "properties": {
+          "action_id": {
+            "type": "string",
+            "description": "Unique ID for this action within the plan"
+          },
+          "action_type": {
+            "type": "string",
+            "enum": [
+              "flush_dns",
+              "restart_network_interface",
+              "release_renew_dhcp",
+              "change_dns_server",
+              "reset_winsock",
+              "reset_tcp_ip",
+              "disable_interface",
+              "enable_interface",
+              "ping_test",
+              "traceroute",
+              "check_firewall",
+              "restart_service"
+            ],
+            "description": "Logical action type mapped to OS commands in actions_map.py"
+          },
+          "description": {
+            "type": "string",
+            "description": "Human-readable explanation of what this action does and why"
+          },
+          "params": {
+            "type": "object",
+            "description": "Optional parameters for the action (e.g. interface name, DNS server IP)",
+            "additionalProperties": true
+          },
+          "risk_level": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Risk classification used by action_guard.py"
+          },
+          "requires_rollback": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whether a snapshot should be taken before executing this action"
+          }
+        }
+      }
+    },
+    "fallback_plan": {
+      "type": "string",
+      "description": "LLM suggestion if all actions fail — shown to user after rollback"
+    }
+  }
+}

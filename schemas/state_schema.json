@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SystemState",
+  "description": "Schema for a network state snapshot produced by collector.py. Used by verifier.py for before/after diff and by memory_context.py for prompt injection.",
+  "type": "object",
+  "required": ["snapshot_id", "timestamp", "os", "probes"],
+  "additionalProperties": false,
+  "properties": {
+    "snapshot_id": {
+      "type": "string",
+      "description": "UUID for this snapshot"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the snapshot was taken"
+    },
+    "os": {
+      "type": "string",
+      "enum": ["linux", "windows", "mac", "unknown"]
+    },
+    "probes": {
+      "type": "object",
+      "required": ["connectivity", "dns", "latency"],
+      "additionalProperties": false,
+      "properties": {
+        "connectivity": {
+          "type": "object",
+          "required": ["status", "reachable_hosts", "unreachable_hosts"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["healthy", "degraded", "failed"]
+            },
+            "reachable_hosts": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "unreachable_hosts": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "details": { "type": "string" }
+          }
+        },
+        "dns": {
+          "type": "object",
+          "required": ["status", "resolved", "failed"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["healthy", "degraded", "failed"]
+            },
+            "resolved": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Domains that resolved successfully"
+            },
+            "failed": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Domains that failed to resolve"
+            },
+            "current_dns_servers": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "details": { "type": "string" }
+          }
+        },
+        "latency": {
+          "type": "object",
+          "required": ["status"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["healthy", "degraded", "failed"]
+            },
+            "avg_ms": {
+              "type": ["number", "null"],
+              "description": "Average round-trip latency in milliseconds"
+            },
+            "packet_loss_pct": {
+              "type": ["number", "null"],
+              "minimum": 0,
+              "maximum": 100
+            },
+            "target_host": { "type": "string" },
+            "details": { "type": "string" }
+          }
+        }
+      }
+    },
+    "overall_health": {
+      "type": "string",
+      "enum": ["healthy", "degraded", "failed"],
+      "description": "Aggregate health derived from all probe statuses"
+    },
+    "anomalies": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of detected anomaly descriptions — injected into planner prompt"
+    }
+  }
+}
