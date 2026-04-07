@@ -11,6 +11,7 @@ import subprocess
 import platform
 import urllib.request
 import time
+import speedtest
 from typing import Any
 
 from utils.logger import get_logger
@@ -452,37 +453,37 @@ def check_wifi() -> dict[str, Any]:
 
 def check_speed() -> dict[str, Any]:
     """
-    Estimates download throughput by fetching a 1 MB file over HTTP and
-    measuring elapsed time.  No third-party dependency required.
-
+    Estimates download throughput using speedtest-cli for multi-server accuracy.
+    
     Thresholds (download Mbps):
         healthy  : >= 5 Mbps
         degraded : >= 1 Mbps and < 5 Mbps
         failed   : < 1 Mbps or fetch error
     """
-    log.debug("Running speed test probe...")
+    log.debug("Running speed test probe via speedtest-cli...")
 
     download_mbps: float | None = None
-    bytes_received = 0
     error_msg = ""
+    server_info = {}
 
     try:
-        req = urllib.request.Request(
-            _SPEED_TEST_DOWNLOAD_URL,
-            headers={"User-Agent": "network-medic/1.0"},
-        )
-        t_start = time.monotonic()
-        with urllib.request.urlopen(req, timeout=_SPEED_TEST_TIMEOUT_SEC) as resp:
-            while True:
-                chunk = resp.read(65536)   # 64 KB chunks
-                if not chunk:
-                    break
-                bytes_received += len(chunk)
-        elapsed = time.monotonic() - t_start
+        st = speedtest.Speedtest()
+        
+        # Fetches the closest/best servers based on ping
+        st.get_best_server() 
+        
+        # Run the download test (returns bits per second)
+        download_bps = st.download()
+        
+        # Convert bits per second to Megabits per second (Mbps)
+        download_mbps = round(download_bps / 1_000_000, 2)
+        
+        # Optional: Grab the server details we tested against
+        server_info = st.results.server
 
-        if elapsed > 0:
-            download_mbps = round((bytes_received * 8) / (elapsed * 1_000_000), 2)
-
+    except speedtest.ConfigRetrievalError as exc:
+        error_msg = "Blocked or no connection to Speedtest servers."
+        log.warning(f"Speed test config failed: {exc}")
     except Exception as exc:
         error_msg = str(exc)
         log.warning(f"Speed test failed: {exc}")
@@ -502,15 +503,14 @@ def check_speed() -> dict[str, Any]:
         details = f"Download speed {download_mbps} Mbps — critically low"
 
     log.info(f"Speed: {status} | download_mbps={download_mbps}")
+    
     return {
         "status":         status,
         "download_mbps":  download_mbps,
-        "bytes_received": bytes_received,
-        "test_url":       _SPEED_TEST_DOWNLOAD_URL,
+        "test_server":    server_info.get("host", "Unknown"),
+        "sponsor":        server_info.get("sponsor", "Unknown"),
         "details":        details,
     }
-
-
 # ── New Probe: Route Table Inspection ────────────────────────────────────────
 
 def check_route_table() -> dict[str, Any]:
