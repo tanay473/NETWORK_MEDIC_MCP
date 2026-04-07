@@ -17,6 +17,8 @@ from modules.monitor.probes import (
     check_interfaces,
     check_ports,
     check_wifi,
+    check_speed,
+    check_route_table,
 )
 from utils.os_detector import get_os
 from utils.logger import get_logger
@@ -100,6 +102,23 @@ def _detect_anomalies(probes: dict) -> list[str]:
             f"WiFi disconnected — SSID={wifi.get('ssid')} signal={wifi.get('signal_strength')}"
         )
 
+    # Speed
+    speed = probes.get("speed", {})
+    if speed.get("status") == "failed":
+        anomalies.append(f"Speed test failed or critically low: {speed.get('details')}")
+    elif speed.get("status") == "degraded":
+        anomalies.append(
+            f"Low download speed detected: {speed.get('download_mbps')} Mbps "
+            "(threshold: 5 Mbps)"
+        )
+
+    # Route table
+    routes = probes.get("route_table", {})
+    if routes.get("status") == "failed":
+        anomalies.append(f"Route table issue: {routes.get('details')}")
+    elif routes.get("status") == "degraded":
+        anomalies.append(f"Route table anomaly: {routes.get('details')}")
+
     return anomalies
 
 
@@ -121,6 +140,8 @@ def collect() -> dict:
         "interfaces":   check_interfaces(),
         "ports":        check_ports(),
         "wifi":         check_wifi(),
+        "speed":        check_speed(),
+        "route_table":  check_route_table(),
     }
 
     overall_health = _derive_overall_health(probes)

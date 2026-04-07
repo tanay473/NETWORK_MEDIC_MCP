@@ -5,9 +5,12 @@ Each probe returns a standardised dict conforming to state_schema.json probe fie
 collector.py calls all probes and assembles the final SystemState.
 """
 
+import re
 import socket
 import subprocess
 import platform
+import urllib.request
+import time
 from typing import Any
 
 from utils.logger import get_logger
@@ -21,6 +24,13 @@ _LATENCY_TARGET     = "8.8.8.8"
 _PING_COUNT         = 4
 _CRITICAL_PORTS     = [53, 80, 443]
 _PORT_TEST_HOST     = "8.8.8.8"
+
+# Speed test settings
+_SPEED_TEST_DOWNLOAD_URL = "http://speedtest.tele2.net/1MB.zip"   # 1 MB file, no auth required
+_SPEED_TEST_TIMEOUT_SEC  = 15
+
+# Route table thresholds
+_MAX_DEFAULT_ROUTES = 1   # more than this → anomaly (metric conflict / VPN bleed)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -436,6 +446,294 @@ def check_wifi() -> dict[str, Any]:
 
     log.info(f"WiFi: {result['status']} | type={result['connection_type']} ssid={result['ssid']}")
     return result
+
+
+# ── New Probe: Speed Test ─────────────────────────────────────────────────────
+
+def check_speed() -> dict[str, Any]:
+    """
+    Estimates download throughput by fetching a 1 MB file over HTTP and
+    measuring elapsed time.  No third-party dependency required.
+
+    Thresholds (download Mbps):
+        healthy  : >= 5 Mbps
+        degraded : >= 1 Mbps and < 5 Mbps
+        failed   : < 1 Mbps or fetch error
+    """
+    log.debug("Running speed test probe...")
+
+    download_mbps: float | None = None
+    bytes_received = 0
+    error_msg = ""
+
+    try:
+        req = urllib.request.Request(
+            _SPEED_TEST_DOWNLOAD_URL,
+            headers={"User-Agent": "network-medic/1.0"},
+        )
+        t_start = time.monotonic()
+        with urllib.request.urlopen(req, timeout=_SPEED_TEST_TIMEOUT_SEC) as resp:
+            while True:
+                chunk = resp.read(65536)   # 64 KB chunks
+                if not chunk:
+                    break
+                bytes_received += len(chunk)
+        elapsed = time.monotonic() - t_start
+
+        if elapsed > 0:
+            download_mbps = round((bytes_received * 8) / (elapsed * 1_000_000), 2)
+
+    except Exception as exc:
+        error_msg = str(exc)
+        log.warning(f"Speed test failed: {exc}")
+
+    # Determine status
+    if download_mbps is None:
+        status  = "failed"
+        details = f"Speed test could not complete: {error_msg}"
+    elif download_mbps >= 5:
+        status  = "healthy"
+        details = f"Download speed {download_mbps} Mbps — nominal"
+    elif download_mbps >= 1:
+        status  = "degraded"
+        details = f"Download speed {download_mbps} Mbps — below expected threshold (5 Mbps)"
+    else:
+        status  = "failed"
+        details = f"Download speed {download_mbps} Mbps — critically low"
+
+    log.info(f"Speed: {status} | download_mbps={download_mbps}")
+    return {
+        "status":         status,
+        "download_mbps":  download_mbps,
+        "bytes_received": bytes_received,
+        "test_url":       _SPEED_TEST_DOWNLOAD_URL,
+        "details":        details,
+    }
+
+
+# ── New Probe: Route Table Inspection ────────────────────────────────────────
+
+def check_route_table() -> dict[str, Any]:
+    """
+    Parses the OS routing table and surfaces diagnostically relevant facts:
+
+      - default_routes      : list of 0.0.0.0/0 entries (gateway + interface + metric)
+      - multiple_defaults   : True if > 1 default route exists (metric conflict / VPN bleed)
+      - vpn_routes          : routes going through tun/tap/vpn interfaces
+      - host_routes         : /32 (Windows: mask 255.255.255.255) overrides for specific IPs
+      - total_routes        : total number of entries parsed
+      - raw_output          : first 60 lines of raw command output for human inspection
+
+    Anomaly logic:
+      healthy  : exactly one default route, no obvious VPN bleed into default
+      degraded : multiple default routes OR VPN interface carrying default traffic
+      failed   : no default route at all (internet traffic has nowhere to go)
+    """
+    log.debug("Running route table probe...")
+    system = platform.system().lower()
+
+    default_routes: list[dict] = []
+    vpn_routes:     list[dict] = []
+    host_routes:    list[dict] = []
+    total_routes    = 0
+    raw_output      = ""
+    parse_error     = ""
+
+    try:
+        if system == "windows":
+            raw_output = _run(["route", "print", "-4"], timeout=8)
+            default_routes, vpn_routes, host_routes, total_routes = _parse_routes_windows(raw_output)
+
+        elif system == "linux":
+            raw_output = _run(["ip", "route", "show"], timeout=8)
+            default_routes, vpn_routes, host_routes, total_routes = _parse_routes_linux(raw_output)
+
+        elif system == "darwin":
+            raw_output = _run(["netstat", "-rn", "-f", "inet"], timeout=8)
+            default_routes, vpn_routes, host_routes, total_routes = _parse_routes_darwin(raw_output)
+
+        else:
+            parse_error = f"Unsupported OS for route table inspection: {system}"
+            log.warning(parse_error)
+
+    except Exception as exc:
+        parse_error = str(exc)
+        log.error(f"Route table probe failed: {exc}")
+
+    # ── Determine status ──────────────────────────────────────────────────────
+    if parse_error and not default_routes:
+        status  = "failed"
+        details = f"Route table unavailable: {parse_error}"
+    elif not default_routes:
+        status  = "failed"
+        details = "No default route (0.0.0.0/0) found — internet traffic has no path."
+    elif len(default_routes) > _MAX_DEFAULT_ROUTES:
+        status  = "degraded"
+        details = (
+            f"{len(default_routes)} default routes detected — metric conflict or VPN bleed likely. "
+            f"Gateways: {[r['gateway'] for r in default_routes]}"
+        )
+    else:
+        # Check if default route runs through a VPN interface
+        vpn_keywords = {"tun", "tap", "vpn", "wg", "utun", "ppp"}
+        default_iface = (default_routes[0].get("interface") or "").lower()
+        if any(kw in default_iface for kw in vpn_keywords):
+            status  = "degraded"
+            details = (
+                f"Default route is through VPN interface '{default_iface}' — "
+                "all internet traffic is being tunnelled."
+            )
+        else:
+            status  = "healthy"
+            details = (
+                f"Single default route via {default_routes[0].get('gateway')} "
+                f"on {default_routes[0].get('interface')} "
+                f"(metric {default_routes[0].get('metric')})"
+            )
+
+    log.info(f"RouteTable: {status} | defaults={len(default_routes)} vpn_routes={len(vpn_routes)}")
+    return {
+        "status":           status,
+        "default_routes":   default_routes,
+        "multiple_defaults": len(default_routes) > _MAX_DEFAULT_ROUTES,
+        "vpn_routes":       vpn_routes,
+        "host_routes":      host_routes,
+        "total_routes":     total_routes,
+        "raw_output":       "\n".join(raw_output.splitlines()[:60]),
+        "details":          details,
+    }
+
+
+# ── Route parsers (per OS) ─────────────────────────────────────────────────────
+
+def _parse_routes_windows(output: str) -> tuple[list, list, list, int]:
+    """
+    Parses `route print -4` output on Windows.
+    Targets the 'IPv4 Route Table' section.
+    Columns: Network Destination | Netmask | Gateway | Interface | Metric
+    """
+    default_routes, vpn_routes, host_routes = [], [], []
+    total = 0
+    in_table = False
+
+    vpn_iface_keywords = {"tun", "tap", "vpn", "ppp"}
+
+    for line in output.splitlines():
+        stripped = line.strip()
+
+        if "Network Destination" in stripped and "Netmask" in stripped:
+            in_table = True
+            continue
+        if in_table and stripped.startswith("="):
+            in_table = False
+            continue
+        if not in_table:
+            continue
+
+        parts = stripped.split()
+        if len(parts) < 5:
+            continue
+
+        dest, mask, gw, iface, *rest = parts
+        metric = rest[0] if rest else "?"
+
+        # Validate looks like IPs
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", dest):
+            continue
+
+        total += 1
+        entry = {"destination": dest, "mask": mask, "gateway": gw,
+                 "interface": iface, "metric": metric}
+
+        if dest == "0.0.0.0" and mask == "0.0.0.0":
+            default_routes.append(entry)
+
+        if mask == "255.255.255.255" and dest not in ("127.0.0.1", "255.255.255.255"):
+            host_routes.append(entry)
+
+        iface_lower = iface.lower()
+        if any(kw in iface_lower for kw in vpn_iface_keywords):
+            vpn_routes.append(entry)
+
+    return default_routes, vpn_routes, host_routes, total
+
+
+def _parse_routes_linux(output: str) -> tuple[list, list, list, int]:
+    """
+    Parses `ip route show` output on Linux.
+    Example line: default via 192.168.1.1 dev eth0 proto dhcp metric 100
+    """
+    default_routes, vpn_routes, host_routes = [], [], []
+    total = 0
+
+    vpn_iface_keywords = {"tun", "tap", "wg", "vpn", "ppp"}
+
+    for line in output.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        total += 1
+
+        dest    = parts[0]
+        gateway = parts[parts.index("via") + 1] if "via" in parts else "on-link"
+        iface   = parts[parts.index("dev") + 1] if "dev" in parts else "unknown"
+        metric  = parts[parts.index("metric") + 1] if "metric" in parts else "?"
+
+        entry = {"destination": dest, "gateway": gateway,
+                 "interface": iface, "metric": metric}
+
+        if dest == "default":
+            default_routes.append(entry)
+
+        if dest.endswith("/32"):
+            host_routes.append(entry)
+
+        iface_lower = iface.lower()
+        if any(kw in iface_lower for kw in vpn_iface_keywords):
+            vpn_routes.append(entry)
+
+    return default_routes, vpn_routes, host_routes, total
+
+
+def _parse_routes_darwin(output: str) -> tuple[list, list, list, int]:
+    """
+    Parses `netstat -rn -f inet` output on macOS.
+    Columns: Destination | Gateway | Flags | Netif | Expire
+    """
+    default_routes, vpn_routes, host_routes = [], [], []
+    total = 0
+    in_table = False
+
+    vpn_iface_keywords = {"utun", "tun", "tap", "ppp", "vpn"}
+
+    for line in output.splitlines():
+        if line.startswith("Destination"):
+            in_table = True
+            continue
+        if not in_table:
+            continue
+
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+
+        dest, gw, flags, iface = parts[0], parts[1], parts[2], parts[3]
+        total += 1
+
+        entry = {"destination": dest, "gateway": gw,
+                 "interface": iface, "flags": flags, "metric": "?"}
+
+        if dest in ("default", "0.0.0.0/0"):
+            default_routes.append(entry)
+
+        if dest.endswith("/32") or (dest.count(".") == 3 and "/" not in dest):
+            host_routes.append(entry)
+
+        iface_lower = iface.lower()
+        if any(kw in iface_lower for kw in vpn_iface_keywords):
+            vpn_routes.append(entry)
+
+    return default_routes, vpn_routes, host_routes, total
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
