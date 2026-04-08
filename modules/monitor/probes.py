@@ -29,6 +29,7 @@ _PORT_TEST_HOST     = "8.8.8.8"
 # Speed test settings
 _SPEED_TEST_DOWNLOAD_URL = "http://speedtest.tele2.net/1MB.zip"   # 1 MB file, no auth required
 _SPEED_TEST_TIMEOUT_SEC  = 15
+_SPEED_NUM_SERVERS       = 3   # number of candidate servers to test against
 
 # Route table thresholds
 _MAX_DEFAULT_ROUTES = 1   # more than this → anomaly (metric conflict / VPN bleed)
@@ -453,64 +454,116 @@ def check_wifi() -> dict[str, Any]:
 
 def check_speed() -> dict[str, Any]:
     """
-    Estimates download throughput using speedtest-cli for multi-server accuracy.
-    
-    Thresholds (download Mbps):
+    Estimates download throughput using speedtest-cli, testing against the
+    top N closest servers by ping and reporting per-server results plus an
+    aggregate (best/avg/worst) across all successful tests.
+
+    Strategy:
+      1. Fetch the N nearest servers ranked by latency via get_closest_servers()
+      2. Run a download test against each one individually
+      3. Report all server results + aggregate stats
+      4. Status is derived from the best (highest) result so that a single
+         slow/congested server does not mask a healthy connection.
+
+    Thresholds (download Mbps — applied to best_mbps):
         healthy  : >= 5 Mbps
         degraded : >= 1 Mbps and < 5 Mbps
-        failed   : < 1 Mbps or fetch error
+        failed   : < 1 Mbps or all tests failed
     """
-    log.debug("Running speed test probe via speedtest-cli...")
+    log.debug(f"Running multi-server speed test probe (N={_SPEED_NUM_SERVERS})...")
 
-    download_mbps: float | None = None
+    server_results: list[dict] = []
     error_msg = ""
-    server_info = {}
 
     try:
         st = speedtest.Speedtest()
-        
-        # Fetches the closest/best servers based on ping
-        st.get_best_server() 
-        
-        # Run the download test (returns bits per second)
-        download_bps = st.download()
-        
-        # Convert bits per second to Megabits per second (Mbps)
-        download_mbps = round(download_bps / 1_000_000, 2)
-        
-        # Optional: Grab the server details we tested against
-        server_info = st.results.server
+
+        # Retrieve the N geographically closest servers sorted by ping
+        closest = st.get_closest_servers()  # returns list sorted by distance
+        candidates = closest[:_SPEED_NUM_SERVERS]
+
+        log.debug(f"Testing against {len(candidates)} servers: "
+                  f"{[s.get('host') for s in candidates]}")
+
+        for server in candidates:
+            host    = server.get("host", "unknown")
+            sponsor = server.get("sponsor", "unknown")
+            try:
+                # Point the Speedtest instance at this specific server
+                st.get_best_server([server])
+
+                download_bps  = st.download()
+                download_mbps = round(download_bps / 1_000_000, 2)
+
+                server_results.append({
+                    "host":          host,
+                    "sponsor":       sponsor,
+                    "download_mbps": download_mbps,
+                    "status":        "ok",
+                })
+                log.info(f"Speed [{host}]: {download_mbps} Mbps")
+
+            except Exception as exc:
+                log.warning(f"Speed test failed for server {host}: {exc}")
+                server_results.append({
+                    "host":          host,
+                    "sponsor":       sponsor,
+                    "download_mbps": None,
+                    "status":        "failed",
+                    "error":         str(exc),
+                })
 
     except speedtest.ConfigRetrievalError as exc:
         error_msg = "Blocked or no connection to Speedtest servers."
         log.warning(f"Speed test config failed: {exc}")
     except Exception as exc:
         error_msg = str(exc)
-        log.warning(f"Speed test failed: {exc}")
+        log.warning(f"Speed test initialisation failed: {exc}")
 
-    # Determine status
-    if download_mbps is None:
+    # ── Aggregate ─────────────────────────────────────────────────────────────
+    successful = [r["download_mbps"] for r in server_results if r["download_mbps"] is not None]
+
+    if not successful:
+        best_mbps = avg_mbps = worst_mbps = None
         status  = "failed"
-        details = f"Speed test could not complete: {error_msg}"
-    elif download_mbps >= 5:
-        status  = "healthy"
-        details = f"Download speed {download_mbps} Mbps — nominal"
-    elif download_mbps >= 1:
-        status  = "degraded"
-        details = f"Download speed {download_mbps} Mbps — below expected threshold (5 Mbps)"
+        details = f"Speed test could not complete: {error_msg or 'all servers failed'}"
     else:
-        status  = "failed"
-        details = f"Download speed {download_mbps} Mbps — critically low"
+        best_mbps  = round(max(successful), 2)
+        avg_mbps   = round(sum(successful) / len(successful), 2)
+        worst_mbps = round(min(successful), 2)
 
-    log.info(f"Speed: {status} | download_mbps={download_mbps}")
-    
+        if best_mbps >= 5:
+            status  = "healthy"
+            details = (
+                f"Download — best: {best_mbps} Mbps | avg: {avg_mbps} Mbps | "
+                f"worst: {worst_mbps} Mbps across {len(successful)} server(s)"
+            )
+        elif best_mbps >= 1:
+            status  = "degraded"
+            details = (
+                f"Low speed — best: {best_mbps} Mbps | avg: {avg_mbps} Mbps | "
+                f"worst: {worst_mbps} Mbps (threshold: 5 Mbps)"
+            )
+        else:
+            status  = "failed"
+            details = (
+                f"Critically low speed — best: {best_mbps} Mbps | avg: {avg_mbps} Mbps"
+            )
+
+    log.info(f"Speed: {status} | best={best_mbps} avg={avg_mbps} worst={worst_mbps} "
+             f"servers_tested={len(server_results)}")
+
     return {
         "status":         status,
-        "download_mbps":  download_mbps,
-        "test_server":    server_info.get("host", "Unknown"),
-        "sponsor":        server_info.get("sponsor", "Unknown"),
+        "download_mbps":  best_mbps,        # kept for backward compat with collector/schema
+        "avg_mbps":       avg_mbps,
+        "worst_mbps":     worst_mbps,
+        "servers_tested": len(server_results),
+        "server_results": server_results,   # full per-server breakdown
         "details":        details,
     }
+
+
 # ── New Probe: Route Table Inspection ────────────────────────────────────────
 
 def check_route_table() -> dict[str, Any]:
